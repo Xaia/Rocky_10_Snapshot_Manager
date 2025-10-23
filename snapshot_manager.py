@@ -67,6 +67,8 @@ class App(tk.Tk):
         # Buttons row
         btns = ttk.Frame(self, padding=8)
         btns.pack(fill="x")
+        # Buttons row (add this next to the others)
+        ttk.Button(btns, text="Detect Snapshots", command=self.detect_snapshots).pack(side="left", padx=6)
         ttk.Button(btns, text="Detect Layout", command=self.detect).pack(side="left")
         ttk.Button(btns, text="Create Snapshots", command=self.create_snaps).pack(side="left", padx=6)
         ttk.Button(btns, text="Add Boom Entry", command=self.add_boom).pack(side="left", padx=6)
@@ -83,6 +85,35 @@ class App(tk.Tk):
         self.txt.insert("end", s if s.endswith("\n") else s+"\n")
         self.txt.see("end")
         self.update_idletasks()
+
+    def detect_snapshots(self):
+        self.log("== Scanning for LVM snapshots ==")
+        rc, out, err = sh("lvs --reportformat json -o vg_name,lv_name,lv_attr,origin,lv_size,data_percent")
+        if rc != 0:
+            self.log(err or "lvs failed")
+            return
+        import json
+        try:
+            data = json.loads(out)
+            rows = data["report"][0]["lv"]
+        except Exception as e:
+            self.log(f"JSON parse error: {e}")
+            return
+        found = False
+        for r in rows:
+            attr = r.get("lv_attr","")
+            if attr and attr[0].lower() == "s":  # 's' = snapshot LV
+                found = True
+                vg   = r.get("vg_name","")
+                name = r.get("lv_name","")
+                orig = r.get("origin","")
+                size = r.get("lv_size","")
+                dper = r.get("data_percent","")
+                self.log(f"{vg}/{name: <24} origin={orig: <24} size={size: <8} Data%={dper}")
+        if not found:
+            self.log("(none found)")
+
+
 
     def detect(self):
         self.log("== Detecting LVM / thinpool / free space ==")
@@ -113,6 +144,25 @@ class App(tk.Tk):
         home_sz = self.home_sz.get()
 
         thin = self.detect()
+        # Check VFree against requested sizes (rough check for classic LVM)
+        rc, vgs_out, _ = sh("vgs --noheadings -o vg_name,vfree")
+        self.log("== vgs ==\n" + vgs_out)
+        try:
+            # crude parse: find our VG line and extract GiB number
+            line = next(l for l in vgs_out.splitlines() if self.vg.get() in l)
+            free_str = line.split()[-1]  # e.g., '2.00g'
+            free_g = float(free_str.lower().rstrip('g'))
+        except Exception:
+            free_g = None
+
+        def to_g(sz):
+            s = sz.strip().lower()
+            return float(s.rstrip('g')) if s.endswith('g') else None
+
+        need_g = sum(filter(None, [to_g(self.root_sz.get()), to_g(self.var_sz.get()), to_g(self.home_sz.get())]))
+        if free_g is not None and need_g is not None and free_g < need_g:
+            messagebox.showwarning(APP_TITLE, f"Not enough free VG space: need ~{need_g}G, have ~{free_g}G.\n"
+                                            f"Delete old snapshots or free space first.")
 
         cmds = []
         if thin:
@@ -193,16 +243,44 @@ class App(tk.Tk):
 
     def delete_snaps(self):
         vg = self.vg.get()
-        for base in ["snap-pre", "var-pre", "home-pre"]:
-            name = self._snap_name(base)
-            rc, _, _ = sh(f"lvs /dev/{vg}/{name}")
-            if rc == 0:
-                rc2, out, err = sh(f"sudo lvremove -y /dev/{vg}/{name}")
-                self.log(out or err or f"Removed {name}")
+        
+        # Remove all Boom entries referencing snapshots in this VG
+        rc, out, _ = sh("boom entry list -o id,title,root_lv")
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    entry_id, title, root_lv = parts[0], ' '.join(parts[1:-1]), parts[-1]
+                    if root_lv.startswith(f"{vg}/") and 'pre-' in root_lv:
+                        rc_del, _, err_del = sh(f"boom entry delete {entry_id}")
+                        if rc_del == 0:
+                            self.log(f"Removed Boom entry {entry_id} for {root_lv}")
+                        else:
+                            self.log(f"Failed to remove Boom entry {entry_id}: {err_del}")
+        
+        # Find and remove all snapshots with 'pre-' in name
+        rc, out, err = sh("lvs --reportformat json -o vg_name,lv_name,lv_attr")
+        if rc == 0:
+            import json
+            try:
+                data = json.loads(out)
+                rows = data["report"][0]["lv"]
+                for r in rows:
+                    attr = r.get("lv_attr", "")
+                    name = r.get("lv_name", "")
+                    lv_vg = r.get("vg_name", "")
+                    if lv_vg == vg and attr and attr[0].lower() == "s" and "pre-" in name:
+                        rc2, out2, err2 = sh(f"lvremove -y /dev/{vg}/{name}")
+                        self.log(out2 or err2 or f"Removed {name}")
+            except Exception as e:
+                self.log(f"JSON parse error: {e}")
+        else:
+            self.log(err or "Failed to list LVs")
+        
         self.show_lvm()
 
     def show_lvm(self):
-        rc, out, err = sh("lvs -o vg_name,lv_name,lv_attr,origin,lv_size,Data% --noheadings")
+        rc, out, err = sh("lvs -o vg_name,lv_name,lv_attr,origin,lv_size,data_percent --noheadings")
         self.log("== lvs ==\n" + (out or err))
         rc, out, err = sh("vgs")
         self.log("== vgs ==\n" + (out or err))
