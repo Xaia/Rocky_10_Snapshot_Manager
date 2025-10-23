@@ -29,7 +29,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("980x720")
+        self.geometry("1300x720")
         self.minsize(900, 640)
 
         # Top form
@@ -68,6 +68,7 @@ class App(tk.Tk):
         btns = ttk.Frame(self, padding=8)
         btns.pack(fill="x")
         # Buttons row (add this next to the others)
+        ttk.Button(btns, text="Install Boom", command=self.install_boom).pack(side="left", padx=6)
         ttk.Button(btns, text="Detect Snapshots", command=self.detect_snapshots).pack(side="left", padx=6)
         ttk.Button(btns, text="Detect Layout", command=self.detect).pack(side="left")
         ttk.Button(btns, text="Create Snapshots", command=self.create_snaps).pack(side="left", padx=6)
@@ -225,6 +226,14 @@ class App(tk.Tk):
         sh("boom entry list --rows")
         rc, out2, _ = sh("boom entry list --rows")
         self.log(out2)
+
+    def install_boom(self):
+        self.log("Installing Boom...")
+        rc, out, err = sh("dnf install -y boom-boot")
+        if rc == 0:
+            self.log("Boom installed successfully.")
+        else:
+            self.log(f"Failed to install Boom: {err}")
 
     def merge_snaps(self):
         vg = self.vg.get()
