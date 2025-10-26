@@ -1,4 +1,5 @@
 # Rocky 10 Snapshot Manager
+<img width="1694" height="809" alt="image" src="https://github.com/user-attachments/assets/89af0b61-5094-433b-88b1-d281862f2039" />
 
 A Tkinter-based GUI application for managing LVM snapshots on Rocky Linux 10, integrating with Boom for boot management.
 
