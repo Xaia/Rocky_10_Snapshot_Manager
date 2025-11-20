@@ -33,5 +33,5 @@ install -m 755 snapshot_manager.py %{buildroot}%{_bindir}/rocky-snapshot-manager
 %{_bindir}/rocky-snapshot-manager
 
 %changelog
-* Wed Oct 23 2025 Xaia <xaia@example.com> - 1.0-1
+* Wed Nov 20 2025 Xaia <xaia@example.com> - 1.0-1
 - Initial package
