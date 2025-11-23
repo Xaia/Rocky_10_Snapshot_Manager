@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # snapshot_manager.py — LVM + Boom GUI for Rocky 10 (XFS/ext4, thin or classic)
 # Run as: sudo python3 snapshot_manager.py
+# Requires: tkinter, boom-boot, boom-boot-conf, python3-boom
 
 import os, subprocess, sys, time, re, json, shutil
 import tkinter as tk
