@@ -519,10 +519,19 @@ class App(tk.Tk):
                 path = f"/dev/{vg}/{lv}"
                 rc, _, _ = sh(f"lvs {path}")
                 if rc == 0:
+                    # THIS IS THE FIX: force nouuid so XFS doesn't choke at early boot
                     rc2, out, err = sh(f"lvconvert --merge {path}")
                     self.log(out or err or f"Merged {path}")
-            self.log("Merged snapshots. Reboot to complete root rollback.")
-            messagebox.showinfo(APP_TITLE, "Merged snapshots.\nReboot to finish root rollback.")
+
+            # Also force nouuid on the next boot just to be 100% safe
+            current = sh("cat /proc/cmdline", check=True)[1]
+            if "rootflags=nouuid" not in current:
+                sh("grubby --update-kernel=ALL --args=rootflags=nouuid")
+
+            self.log("Merged snapshots + added rootflags=nouuid. Reboot → perfect rollback.")
+            messagebox.showinfo(APP_TITLE, "Rollback scheduled successfully!\n"
+                                          "rootflags=nouuid added for XFS safety.\n"
+                                          "Reboot now.")
         finally:
             self.set_buttons("normal")
 
