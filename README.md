@@ -27,7 +27,11 @@ Install the RPM package:
 ```bash
 sudo dnf install rocky-snapshot-manager-1.0-1.noarch.rpm
 ```
-
+```bash
+sudo dnf reinstall ./rocky-snapshot-manager-*.noarch.rpm
+# or if you have a newer version:
+sudo dnf upgrade ./rocky-snapshot-manager-1.1-1.el10.noarch.rpm
+```
 ## Usage
 
 Run the application:
