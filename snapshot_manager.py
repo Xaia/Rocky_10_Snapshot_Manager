@@ -90,6 +90,7 @@ class App(tk.Tk):
         ttk.Button(btns, text="Add Boom Entry", command=self.add_boom).pack(side="left", padx=6)
         ttk.Button(btns, text="Merge (Rollback)", command=self.merge_snaps).pack(side="left", padx=6)
         ttk.Button(btns, text="Delete Snapshots", command=self.delete_snaps).pack(side="left", padx=6)
+        ttk.Button(btns, text="Clean Boom Snapshots", command=self.clean_boom_snapshots_keep_newest).pack(side="left", padx=6)
         ttk.Button(btns, text="Show LVM", command=self.show_lvm).pack(side="left", padx=6)
         ttk.Button(btns, text="Use Unallocated Space (grow PV)", command=self.grow_pv_path_a).pack(side="left", padx=12)
         ttk.Button(btns, text="Add New PV (use free disk)", command=self.add_new_pv_path_b).pack(side="left", padx=6)
@@ -426,6 +427,7 @@ class App(tk.Tk):
     def add_boom(self):
         vg = self.vg.get()
         root_snap = self._snap_name("snap-pre")
+
         # ensure /boot writable
         sh("mount | grep ' on /boot ' && mount -o remount,rw /boot")
 
@@ -435,29 +437,35 @@ class App(tk.Tk):
         linux = f"/vmlinuz-{ver}"
         initrd = f"/initramfs-{ver}.img"
 
-        # Build --options
-        options = ""
-        if self.use_current_opts.get():
-            rc_c, cur, _ = sh("cat /proc/cmdline")
-            if rc_c == 0 and cur.strip():
-                tokens = cur.strip().split()
-                if self.clean_current_opts.get():
-                    # drop conflicting/unsafe items; keep everything else (like resume=, NVIDIA flags, etc.)
-                    drop_keys = ("root=", "rd.lvm.lv=")
-                    tokens = [
-                        t for t in tokens
-                        if not t.startswith(drop_keys) and t not in ("ro", "rw")
-                    ]
-                # ensure read-only unless user provided rw explicitly in Extra options
-                if all(t not in ("ro", "rw") for t in tokens):
-                    tokens.insert(0, "ro")
-                options = " ".join(tokens).strip()
+        # Detect filesystem type of the root snapshot
+        rc_fs, fstype, err_fs = sh(f"lsblk -no FSTYPE /dev/{vg}/{root_snap}")
+        if rc_fs != 0:
+            self.log(f"Warning: Could not detect filesystem type for {root_snap}: {err_fs}")
+            fstype = ""
+        else:
+            fstype = fstype.strip().lower()
+            self.log(f"Detected filesystem type for {root_snap}: {fstype}")
 
         extra = (self.extra_opts.get() or "").strip()
-        if extra:
-            options = (options + " " + extra).strip() if options else extra
 
-        # Try plain create first (works on hosts with a matching HostProfile)
+        # detect fs type, choose rootflag
+        if fstype == "xfs":
+            rootflag = "nouuid"
+        elif fstype == "ext4":
+            rootflag = "noload"
+        else:
+            rootflag = None
+
+        opts_list = []
+        if rootflag:
+            opts_list.append(f"rootflags={rootflag}")
+        if extra:
+            opts_list.append(extra)
+
+        add_opts = " ".join(opts_list)
+        self.log(f"Final extra options for Boom entry: '{add_opts}'")
+
+        # Base create command (let Boom/OS profile supply normal kernelopts)
         base_cmd = (
             f"boom entry create "
             f"--linux '{linux}' "
@@ -465,41 +473,50 @@ class App(tk.Tk):
             f"--root-lv {vg}/{root_snap} "
             f"--title 'Rollback: {self.stamp.get()} (root snapshot)'"
         )
-        cmd = base_cmd + (f" --options '{options}'" if options else "")
+        cmd = base_cmd + (f" --add-opts '{add_opts}'" if add_opts else "")
+
         rc, out, err = sh(cmd)
         if rc == 0:
             self.log(out or "Boom entry created.")
-            rc2, out2, _ = sh("boom entry list --rows"); self.log(out2)
+            rc2, out2, _ = sh("boom entry list --rows")
+            self.log(out2)
             return
 
         # If Boom demands a profile, ensure one exists and retry with --profile
-        if "requires --profile" in (err.lower() + out.lower()):
+        combined = (err or "") + (out or "")
+        if "requires --profile" in combined.lower():
             self.log("Boom requires a profile; ensuring a minimal Rocky 10 profile exists...")
             osid = self.ensure_boom_profile()
             if not osid:
                 self.log("Failed to obtain a Boom OsID.")
                 messagebox.showerror(APP_TITLE, "Could not obtain a Boom OsID.")
                 return
+
             cmd2 = (
                 f"boom entry create --profile '{osid}' "
                 f"--linux '{linux}' "
                 f"--initrd '{initrd}' "
                 f"--root-lv {vg}/{root_snap} "
                 f"--title 'Rollback: {self.stamp.get()} (root snapshot)'"
-                + (f" --options '{options}'" if options else "")
             )
+            if add_opts:
+                cmd2 += f" --add-opts '{add_opts}'"
+
             rc2, out2, err2 = sh(cmd2)
             if rc2 != 0:
                 self.log(f"ERR: {cmd2}\n{err2 or out2}")
                 messagebox.showerror(APP_TITLE, f"Boom entry failed after profile creation:\n{err2 or out2}")
                 return
+
             self.log(out2 or "Boom entry created (after creating profile).")
-            rc3, out3, _ = sh("boom entry list --rows"); self.log(out3)
+            rc3, out3, _ = sh("boom entry list --rows")
+            self.log(out3)
             return
 
         # other error
         self.log(f"ERR: {cmd}\n{err or out}")
         messagebox.showerror(APP_TITLE, f"Boom entry failed:\n{err or out}")
+
 
 
     def install_boom(self):
@@ -523,14 +540,24 @@ class App(tk.Tk):
                     rc2, out, err = sh(f"lvconvert --merge {path}")
                     self.log(out or err or f"Merged {path}")
 
-            # Also force nouuid on the next boot just to be 100% safe
-            current = sh("cat /proc/cmdline", check=True)[1]
-            if "rootflags=nouuid" not in current:
-                sh("grubby --update-kernel=ALL --args=rootflags=nouuid")
+            # Also force appropriate rootflags on the next boot for filesystem safety
+            rc_fs, fstype, _ = sh(f"lsblk -no FSTYPE /dev/{vg}/{self.root_lv.get()}")
+            fstype = fstype.strip().lower()
+            if fstype == "xfs":
+                rootflag = "nouuid"
+            elif fstype == "ext4":
+                rootflag = "noload"
+            else:
+                rootflag = None
+            
+            if rootflag:
+                current = sh("cat /proc/cmdline", check=True)[1]
+                if f"rootflags={rootflag}" not in current:
+                    sh(f"grubby --update-kernel=ALL --args=rootflags={rootflag}")
 
-            self.log("Merged snapshots + added rootflags=nouuid. Reboot → perfect rollback.")
-            messagebox.showinfo(APP_TITLE, "Rollback scheduled successfully!\n"
-                                          "rootflags=nouuid added for XFS safety.\n"
+            self.log(f"Merged snapshots + added rootflags={rootflag or 'none'}. Reboot → perfect rollback.")
+            messagebox.showinfo(APP_TITLE, f"Rollback scheduled successfully!\n"
+                                          f"rootflags={rootflag or 'none'} added for filesystem safety.\n"
                                           "Reboot now.")
         finally:
             self.set_buttons("normal")
@@ -538,16 +565,21 @@ class App(tk.Tk):
     def delete_snaps(self):
         vg = self.vg.get()
         # remove Boom entries that reference our snapshots
-        rc, out, _ = sh("boom entry list --rows -o id,root_lv,title --separator '|'")
+        rc, out, _ = sh("boom entry list -o bootid,rootdev,title --separator '|'")
         if rc == 0 and out:
             for line in out.splitlines():
                 parts = [p.strip() for p in line.split('|', 2)]
-                if len(parts) == 3:
-                    entry_id, root_lv, title = parts
-                    if root_lv.startswith(f"{vg}/") and 'pre-' in root_lv:
-                        rc_del, out_del, err_del = sh(f"boom entry delete {entry_id}")
-                        if rc_del == 0: self.log(f"Removed Boom entry {entry_id} for {root_lv}")
-                        else: self.log(f"Failed to remove Boom entry {entry_id}: {err_del}")
+                if len(parts) != 3:
+                    continue
+                boot_id, rootdev, title = parts
+                # skip header line (where boot_id would be 'BootID')
+                if boot_id.lower() == 'bootid' or rootdev.lower() == 'rootdevice':
+                    continue
+                # rootdev looks like /dev/rl/snap-pre-... or /dev/mapper/rl-root
+                if f"/dev/{vg}/" in rootdev and 'pre-' in rootdev:
+                    rc_del, out_del, err_del = sh(f"boom entry delete {boot_id}")
+                    if rc_del == 0: self.log(f"Removed Boom entry {boot_id} for {rootdev}")
+                    else: self.log(f"Failed to remove Boom entry {boot_id}: {err_del}")
 
         # remove snapshot LVs (names containing 'pre-' and attr starting with 's')
         rc, out, err = sh("lvs --reportformat json -o vg_name,lv_name,lv_attr")
@@ -565,6 +597,61 @@ class App(tk.Tk):
             self.log(err or "Failed to list LVs")
 
         self.show_lvm()
+
+    def clean_boom_snapshots_keep_newest(self):
+        """Keep only the single newest Boom snapshot entry; delete all older ones.
+
+        We look for entries whose rootdev belongs to our VG and contains 'pre-'.
+        We sort all matching entries by the timestamp in their rootdev name
+        (e.g., snap-pre-2025-11-26-2321) and keep only the newest one.
+        """
+        vg = self.vg.get()
+        self.log("== Cleaning Boom snapshot entries (keep newest only) ==")
+        # Use 'bootid' and 'rootdev' - these are the actual Boom field names
+        rc, out, err = sh("boom entry list -o bootid,rootdev,title --separator '|'")
+        if rc != 0 or not out.strip():
+            self.log(err or "No Boom entries found or boom failed.")
+            return
+
+        snapshot_entries = []
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split('|', 2)]
+            if len(parts) != 3:
+                continue
+            boot_id, rootdev, title = parts
+            # skip header line
+            if boot_id.lower() == 'bootid' or rootdev.lower() == 'rootdevice':
+                continue
+            # only care about entries for this VG and our snapshot naming (pre-)
+            if f"/dev/{vg}/" not in rootdev:
+                continue
+            if 'pre-' not in rootdev:
+                continue
+            snapshot_entries.append((boot_id, rootdev, title))
+
+        if not snapshot_entries:
+            self.log("No Boom snapshot entries to clean.")
+            return
+
+        if len(snapshot_entries) == 1:
+            self.log(f"Only one snapshot entry found ({snapshot_entries[0][0]}), nothing to clean.")
+            return
+
+        # Sort by rootdev name (which contains timestamp like snap-pre-2025-11-26-2321)
+        # The timestamp format sorts lexicographically correctly
+        entries_sorted = sorted(snapshot_entries, key=lambda t: t[1])
+        keep_entry = entries_sorted[-1]
+        self.log(f"Keeping newest entry: {keep_entry[0]} ({keep_entry[1]})")
+        self.log(f"Removing {len(entries_sorted) - 1} older snapshot entries...")
+
+        for (boot_id, rootdev, title) in entries_sorted[:-1]:
+            rc_del, out_del, err_del = sh(f"boom entry delete {boot_id}")
+            if rc_del == 0:
+                self.log(f"Removed: {boot_id} ({rootdev})")
+            else:
+                self.log(f"Failed to remove {boot_id}: {err_del or out_del}")
+
+        self.log("Done cleaning Boom snapshot entries.")
 
     def show_lvm(self):
         rc, out, err = sh("lvs -o vg_name,lv_name,lv_attr,origin,lv_size,data_percent --noheadings")
